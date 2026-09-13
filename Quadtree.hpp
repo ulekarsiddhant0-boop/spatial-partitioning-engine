@@ -1,129 +1,178 @@
 #pragma once
 #include <vector>
-#include <memory>
 #include <cmath>
+#include <cstdint>
 
-struct Vec2 {
+struct Vec2
+{
     float x, y;
+
+    Vec2 operator+(const Vec2 &o) const { return {x + o.x, y + o.y}; }
+    Vec2 operator-(const Vec2 &o) const { return {x - o.x, y - o.y}; }
+    Vec2 operator*(float s) const { return {x * s, y * s}; }
+    float dot(const Vec2 &o) const { return x * o.x + y * o.y; }
+    float lengthSq() const { return x * x + y * y; }
+    float length() const { return std::sqrt(lengthSq()); }
+    Vec2 normalized() const
+    {
+        float l = length();
+        return l > 0.0001f ? Vec2{x / l, y / l} : Vec2{0, 0};
+    }
 };
 
-struct AABB {
-    float x, y; // Center coordinates
+struct AABB
+{
+    float x, y; // Center
     float halfW, halfH;
 
-    bool contains(const Vec2& point) const {
-        return (point.x >= x - halfW && point.x <= x + halfW &&
-                point.y >= y - halfH && point.y <= y + halfH);
+    bool contains(const Vec2 &pt) const
+    {
+        return (pt.x >= x - halfW && pt.x <= x + halfW &&
+                pt.y >= y - halfH && pt.y <= y + halfH);
     }
 
-    bool intersects(const AABB& other) const {
-        return !(other.x - other.halfW > x + halfW ||
-                 other.x + other.halfW < x - halfW ||
-                 other.y - other.halfH > y + halfH ||
-                 other.y + other.halfH < y - halfH);
+    bool intersects(const AABB &o) const
+    {
+        return !(o.x - o.halfW > x + halfW ||
+                 o.x + o.halfW < x - halfW ||
+                 o.y - o.halfH > y + halfH ||
+                 o.y + o.halfH < y - halfH);
     }
 };
 
-struct Entity {
+struct Entity
+{
     int id;
     Vec2 pos;
     Vec2 vel;
     float radius;
+    float mass;
     bool isColliding;
 };
 
-class Quadtree {
-private:
+// Flat array Node Pool Quadtree: Zero runtime heap fragmentation
+class QuadtreePool
+{
+public:
     static constexpr int CAPACITY = 8;
     static constexpr int MAX_DEPTH = 6;
 
-    int depth;
-    AABB boundary;
-    std::vector<Entity*> points;
-    bool divided;
+    struct Node
+    {
+        AABB boundary;
+        int depth;
+        int count = 0;
+        int entityIndices[CAPACITY];
+        int childIndex = -1; // Index in node pool; -1 if leaf
+        bool isLeaf() const { return childIndex == -1; }
+    };
 
-    std::unique_ptr<Quadtree> northWest;
-    std::unique_ptr<Quadtree> northEast;
-    std::unique_ptr<Quadtree> southWest;
-    std::unique_ptr<Quadtree> southEast;
+private:
+    std::vector<Node> nodes;
+    const std::vector<Entity> *entitiesRef;
 
-    void subdivide() {
-        float x = boundary.x;
-        float y = boundary.y;
-        float w = boundary.halfW / 2.0f;
-        float h = boundary.halfH / 2.0f;
+    void subdivide(int nodeIdx)
+    {
+        int nextChildIdx = static_cast<int>(nodes.size());
+        nodes[nodeIdx].childIndex = nextChildIdx;
+        nodes.resize(nextChildIdx + 4);
 
-        northWest = std::make_unique<Quadtree>(AABB{x - w, y - h, w, h}, depth + 1);
-        northEast = std::make_unique<Quadtree>(AABB{x + w, y - h, w, h}, depth + 1);
-        southWest = std::make_unique<Quadtree>(AABB{x - w, y + h, w, h}, depth + 1);
-        southEast = std::make_unique<Quadtree>(AABB{x + w, y + h, w, h}, depth + 1);
+        float x = nodes[nodeIdx].boundary.x;
+        float y = nodes[nodeIdx].boundary.y;
+        float w = nodes[nodeIdx].boundary.halfW * 0.5f;
+        float h = nodes[nodeIdx].boundary.halfH * 0.5f;
+        int d = nodes[nodeIdx].depth + 1;
 
-        divided = true;
+        nodes[nextChildIdx + 0] = Node{{x - w, y - h, w, h}, d}; // NW
+        nodes[nextChildIdx + 1] = Node{{x + w, y - h, w, h}, d}; // NE
+        nodes[nextChildIdx + 2] = Node{{x - w, y + h, w, h}, d}; // SW
+        nodes[nextChildIdx + 3] = Node{{x + w, y + h, w, h}, d}; // SE
 
-        // Push existing points into children
-        for (Entity* e : points) {
-            insertIntoChildren(e);
+        // Re-distribute parent elements to children
+        for (int i = 0; i < nodes[nodeIdx].count; ++i)
+        {
+            int eIdx = nodes[nodeIdx].entityIndices[i];
+            insertIntoChildren(nodeIdx, eIdx);
         }
-        points.clear();
+        nodes[nodeIdx].count = 0;
     }
 
-    bool insertIntoChildren(Entity* entity) {
-        if (northWest->insert(entity)) return true;
-        if (northEast->insert(entity)) return true;
-        if (southWest->insert(entity)) return true;
-        if (southEast->insert(entity)) return true;
+    bool insertIntoChildren(int parentIdx, int entityIdx)
+    {
+        int base = nodes[parentIdx].childIndex;
+        const Vec2 &p = (*entitiesRef)[entityIdx].pos;
+
+        for (int i = 0; i < 4; ++i)
+        {
+            if (nodes[base + i].boundary.contains(p))
+            {
+                return insertInternal(base + i, entityIdx);
+            }
+        }
         return false;
     }
 
+    bool insertInternal(int nodeIdx, int entityIdx)
+    {
+        if (!nodes[nodeIdx].isLeaf())
+        {
+            return insertIntoChildren(nodeIdx, entityIdx);
+        }
+
+        if (nodes[nodeIdx].count < CAPACITY || nodes[nodeIdx].depth >= MAX_DEPTH)
+        {
+            nodes[nodeIdx].entityIndices[nodes[nodeIdx].count++] = entityIdx;
+            return true;
+        }
+
+        subdivide(nodeIdx);
+        return insertIntoChildren(nodeIdx, entityIdx);
+    }
+
 public:
-    Quadtree(AABB boundary, int depth = 0)
-        : boundary(boundary), depth(depth), divided(false) {
-        points.reserve(CAPACITY);
+    QuadtreePool()
+    {
+        nodes.reserve(2048);
     }
 
-    bool insert(Entity* entity) {
-        if (!boundary.contains(entity->pos)) {
-            return false;
-        }
-
-        if (!divided) {
-            if (points.size() < CAPACITY || depth >= MAX_DEPTH) {
-                points.push_back(entity);
-                return true;
-            }
-            subdivide();
-        }
-
-        return insertIntoChildren(entity);
+    void reset(AABB rootBoundary, const std::vector<Entity> &entities)
+    {
+        nodes.clear();
+        entitiesRef = &entities;
+        nodes.push_back(Node{rootBoundary, 0});
     }
 
-    void query(const AABB& range, std::vector<Entity*>& found) const {
-        if (!boundary.intersects(range)) {
+    void insert(int entityIdx)
+    {
+        insertInternal(0, entityIdx);
+    }
+
+    void query(const AABB &range, std::vector<int> &results, int nodeIdx = 0) const
+    {
+        if (nodeIdx < 0 || nodeIdx >= (int)nodes.size())
             return;
-        }
+        const auto &node = nodes[nodeIdx];
 
-        for (Entity* e : points) {
-            if (range.contains(e->pos)) {
-                found.push_back(e);
+        if (!node.boundary.intersects(range))
+            return;
+
+        for (int i = 0; i < node.count; ++i)
+        {
+            int eIdx = node.entityIndices[i];
+            if (range.contains((*entitiesRef)[eIdx].pos))
+            {
+                results.push_back(eIdx);
             }
         }
 
-        if (divided) {
-            northWest->query(range, found);
-            northEast->query(range, found);
-            southWest->query(range, found);
-            southEast->query(range, found);
+        if (!node.isLeaf())
+        {
+            for (int i = 0; i < 4; ++i)
+            {
+                query(range, results, node.childIndex + i);
+            }
         }
     }
 
-    // Accessor for rendering tree lines
-    void getBoundaries(std::vector<AABB>& boxes) const {
-        boxes.push_back(boundary);
-        if (divided) {
-            northWest->getBoundaries(boxes);
-            northEast->getBoundaries(boxes);
-            southWest->getBoundaries(boxes);
-            southEast->getBoundaries(boxes);
-        }
-    }
+    const std::vector<Node> &getAllNodes() const { return nodes; }
 };
